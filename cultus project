@@ -1,0 +1,193 @@
+# ============================================================
+# HIERARCHICAL TIME SERIES FORECASTING – SINGLE FILE PROJECT
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import torch
+import pytorch_lightning as pl
+
+from pytorch_forecasting import (
+    TimeSeriesDataSet,
+    TemporalFusionTransformer
+)
+from pytorch_forecasting.data import GroupNormalizer
+from pytorch_forecasting.metrics import QuantileLoss
+
+# ============================================================
+# 1. DATA GENERATION (HIERARCHICAL)
+# ============================================================
+
+def generate_hierarchical_data():
+    np.random.seed(42)
+
+    dates = pd.date_range(start="2018-01-01", periods=1000, freq="D")
+    regions = ["North", "South"]
+    categories = ["Electronics", "Clothing"]
+
+    rows = []
+
+    for region in regions:
+        for category in categories:
+            base = 120 if category == "Electronics" else 70
+            trend = np.linspace(0, 40, len(dates))
+            seasonality = 15 * np.sin(2 * np.pi * np.arange(len(dates)) / 7)
+            noise = np.random.normal(0, 5, len(dates))
+
+            sales = base + trend + seasonality + noise
+
+            for d, s in zip(dates, sales):
+                rows.append({
+                    "date": d,
+                    "region": region,
+                    "category": category,
+                    "sales": max(s, 0)
+                })
+
+    df = pd.DataFrame(rows)
+    df["series_id"] = df["region"] + "_" + df["category"]
+    df["time_idx"] = (df["date"] - df["date"].min()).dt.days
+
+    return df
+
+
+# ============================================================
+# 2. DATASET PREPARATION
+# ============================================================
+
+def prepare_datasets(df):
+    max_encoder_length = 60
+    max_prediction_length = 30
+
+    training_cutoff = df["time_idx"].max() - max_prediction_length
+
+    training = TimeSeriesDataSet(
+        df[df.time_idx <= training_cutoff],
+        time_idx="time_idx",
+        target="sales",
+        group_ids=["series_id"],
+        static_categoricals=["region", "category"],
+        time_varying_known_reals=["time_idx"],
+        time_varying_unknown_reals=["sales"],
+        min_encoder_length=max_encoder_length,
+        max_encoder_length=max_encoder_length,
+        min_prediction_length=max_prediction_length,
+        max_prediction_length=max_prediction_length,
+        target_normalizer=GroupNormalizer(groups=["series_id"]),
+    )
+
+    validation = TimeSeriesDataSet.from_dataset(
+        training,
+        df,
+        predict=True,
+        stop_randomization=True
+    )
+
+    return training, validation
+
+
+# ============================================================
+# 3. MODEL DEFINITION (TEMPORAL FUSION TRANSFORMER)
+# ============================================================
+
+def build_model(training_dataset):
+    model = TemporalFusionTransformer.from_dataset(
+        training_dataset,
+        learning_rate=0.001,
+        hidden_size=16,
+        attention_head_size=4,
+        dropout=0.1,
+        hidden_continuous_size=8,
+        output_size=7,
+        loss=QuantileLoss(),
+        log_interval=10,
+        reduce_on_plateau_patience=4,
+    )
+    return model
+
+
+# ============================================================
+# 4. TRAINING
+# ============================================================
+
+def train_model(model, training, validation):
+    train_loader = training.to_dataloader(
+        train=True, batch_size=64, num_workers=0
+    )
+    val_loader = validation.to_dataloader(
+        train=False, batch_size=64, num_workers=0
+    )
+
+    trainer = pl.Trainer(
+        max_epochs=20,
+        accelerator="auto",
+        gradient_clip_val=0.1,
+        enable_model_summary=True,
+        log_every_n_steps=10
+    )
+
+    trainer.fit(model, train_loader, val_loader)
+    return model, val_loader
+
+
+# ============================================================
+# 5. EVALUATION METRICS
+# ============================================================
+
+def smape(y_true, y_pred):
+    return 100 * np.mean(
+        2 * np.abs(y_pred - y_true) /
+        (np.abs(y_true) + np.abs(y_pred) + 1e-8)
+    )
+
+def mase(y_true, y_pred):
+    naive_forecast = np.roll(y_true, 1)
+    naive_forecast[0] = y_true[0]
+
+    mae_model = np.mean(np.abs(y_true - y_pred))
+    mae_naive = np.mean(np.abs(y_true - naive_forecast))
+
+    return mae_model / mae_naive
+
+
+# ============================================================
+# 6. MAIN PIPELINE
+# ============================================================
+
+def main():
+    print("\nGenerating hierarchical dataset...")
+    df = generate_hierarchical_data()
+    print(df.head())
+
+    print("\nPreparing datasets...")
+    training, validation = prepare_datasets(df)
+
+    print("\nBuilding model...")
+    model = build_model(training)
+    print(model)
+
+    print("\nTraining model...")
+    model, val_loader = train_model(model, training, validation)
+
+    print("\nGenerating predictions...")
+    predictions = model.predict(val_loader)
+    predictions = predictions.detach().cpu().numpy()
+
+    # Get actual values
+    actuals = torch.cat([y[0] for x, y in iter(val_loader)])
+    actuals = actuals.detach().cpu().numpy()
+
+    print("\nEvaluation Metrics:")
+    print("sMAPE:", smape(actuals.flatten(), predictions.flatten()))
+    print("MASE :", mase(actuals.flatten(), predictions.flatten()))
+
+    print("\nSample Predictions:")
+    print(predictions[:5])
+
+
+# ============================================================
+# 7. RUN
+# ============================================================
+
+if __name__ == "__main__":
+    main()
